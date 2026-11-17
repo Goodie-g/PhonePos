@@ -1,0 +1,17 @@
+# Optional: reproducible local PostgreSQL.
+#   docker compose up -d postgres
+# Connection from the app: postgresql://stoku:stoku@localhost:5433/stoku?schema=public
+services:
+  postgres:
+    image: postgres:17
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: stoku
+      POSTGRES_PASSWORD: stoku
+      POSTGRES_DB: stoku
+    volumes:
+      - stoku_pgdata:/var/lib/postgresql/data
+
+volumes:
+  stoku_pgdata:

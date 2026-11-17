@@ -1,0 +1,842 @@
+// Stoku — wholesale & distribution schema
+// Conventions:
+//  * Every business-owned row carries businessId (tenant isolation is enforced
+//    in the service layer AND by these relations).
+//  * Money is Decimal(19,4) — never Float.
+//  * Human-facing document numbers are unique per business and generated from
+//    DocumentCounter inside the same transaction that creates the document.
+//  * Quantities are Int; InventoryBalance.onHand/reserved are kept consistent
+//    with the append-only StockMovement ledger by service code.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Tenancy & auth ─────────────────────────────
+
+enum Role {
+  OWNER
+  ADMIN
+  SALES_MANAGER
+  SALES_REP
+  WAREHOUSE_MANAGER
+  WAREHOUSE_STAFF
+  CASHIER
+}
+
+model Business {
+  id             String   @id @default(uuid())
+  name           String
+  currency       String   @default("TZS")
+  timezone       String   @default("Africa/Dar_es_Salaam")
+  // Percent applied on the (discounted) order subtotal when invoicing.
+  taxRatePercent Decimal  @default(0) @db.Decimal(5, 2)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  memberships    Membership[]
+  users          User[]          @relation("BusinessCreatedUsers")
+  warehouses     Warehouse[]
+  brands         Brand[]
+  categories     Category[]
+  products       Product[]
+  variants       ProductVariant[]
+  devices        Device[]
+  suppliers      Supplier[]
+  purchaseOrders PurchaseOrder[]
+  goodsReceipts  GoodsReceipt[]
+  customers      Customer[]
+  priceLists     PriceList[]
+  salesOrders    SalesOrder[]
+  invoices       Invoice[]
+  payments       Payment[]
+  transfers      StockTransfer[]
+  shipments      Shipment[]
+  returns        SalesReturn[]
+  movements      StockMovement[]
+  reservations   StockReservation[]
+  balances       InventoryBalance[]
+  auditLogs      AuditLog[]
+  idempotencyKeys IdempotencyKey[]
+  counters       DocumentCounter[]
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique // stored lowercased
+  passwordHash String
+  fullName     String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships   Membership[]
+  refreshTokens RefreshToken[]
+  businessesCreated Business[] @relation("BusinessCreatedUsers")
+}
+
+model Membership {
+  id         String   @id @default(uuid())
+  userId     String
+  businessId String
+  role       Role
+  createdAt  DateTime @default(now())
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, businessId])
+  @@index([businessId])
+}
+
+// Rotating refresh tokens. Only a SHA-256 hash is stored; on every refresh the
+// old token is revoked and replaced (theft of a reused token is detectable).
+model RefreshToken {
+  id           String    @id @default(uuid())
+  userId       String
+  tokenHash    String    @unique
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  replacedById String?
+  userAgent    String?
+  ip           String?
+  createdAt    DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ───────────────────────────── Catalogue ─────────────────────────────
+
+model Brand {
+  id         String    @id @default(uuid())
+  businessId String
+  name       String
+  business   Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  products   Product[]
+
+  @@unique([businessId, name])
+}
+
+model Category {
+  id         String    @id @default(uuid())
+  businessId String
+  name       String
+  business   Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  products   Product[]
+
+  @@unique([businessId, name])
+}
+
+enum ProductType {
+  PHONE
+  ACCESSORY
+}
+
+enum ProductStatus {
+  ACTIVE
+  DISCONTINUED
+}
+
+// A product MODEL (e.g. "Galaxy A15"). Not sellable by itself.
+model Product {
+  id          String        @id @default(uuid())
+  businessId  String
+  brandId     String
+  categoryId  String?
+  name        String
+  type        ProductType
+  status      ProductStatus @default(ACTIVE)
+  description String?
+  imageUrl    String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  business   Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  brand      Brand            @relation(fields: [brandId], references: [id])
+  category   Category?        @relation(fields: [categoryId], references: [id])
+  variants   ProductVariant[]
+
+  @@unique([businessId, brandId, name])
+  @@index([businessId, status])
+}
+
+// A sellable VARIANT (e.g. "Galaxy A15 128GB / 4GB RAM / Blue").
+// Phones are sold as tracked Devices; accessories as plain quantities.
+model ProductVariant {
+  id                String   @id @default(uuid())
+  businessId        String
+  productId         String
+  sku               String
+  barcode           String?
+  storageGb         Int?
+  ramGb             Int?
+  color             String?
+  costPrice         Decimal  @default(0) @db.Decimal(19, 4)
+  sellPrice         Decimal  @db.Decimal(19, 4)
+  lowStockThreshold Int      @default(5)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  business        Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  product         Product            @relation(fields: [productId], references: [id], onDelete: Cascade)
+  devices         Device[]
+  balances        InventoryBalance[]
+  movements       StockMovement[]
+  purchaseItems   PurchaseOrderItem[]
+  orderItems      SalesOrderItem[]
+  priceListItems  PriceListItem[]
+  reservations    StockReservation[]
+  transferItems   StockTransferItem[]
+
+  @@unique([businessId, sku])
+  @@index([productId])
+}
+
+// ───────────────────────────── IMEI devices ─────────────────────────────
+
+enum DeviceStatus {
+  RECEIVED         // just received, not yet sellable (e.g. awaiting checks)
+  AVAILABLE        // sellable
+  RESERVED         // allocated to a sales order
+  SOLD             // fulfilled / dispatched
+  RETURNED         // returned by a customer, awaiting inspection
+  UNDER_INSPECTION // being inspected after return
+  QUARANTINED      // failed inspection — not sellable
+  IN_TRANSIT       // dispatched on a warehouse transfer, not yet received
+}
+
+// An individual physical handset. IMEIs are globally unique (reality, and it
+// also prevents the same phone being registered by two tenants).
+model Device {
+  id                   String       @id @default(uuid())
+  businessId           String
+  variantId            String
+  warehouseId          String
+  imei1                String       @unique
+  imei2                String?      @unique
+  serialNumber         String?
+  status               DeviceStatus @default(RECEIVED)
+  acquisitionCost      Decimal      @db.Decimal(19, 4)
+  supplierId           String?
+  purchaseItemId       String?
+  goodsReceiptId       String?
+  reservedOrderItemId  String?
+  soldOrderItemId      String?
+  warrantyMonths       Int?
+  notes                String?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  business   Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  variant    ProductVariant    @relation(fields: [variantId], references: [id])
+  warehouse  Warehouse         @relation(fields: [warehouseId], references: [id])
+  supplier   Supplier?         @relation(fields: [supplierId], references: [id])
+  purchaseItem PurchaseOrderItem? @relation(fields: [purchaseItemId], references: [id])
+  goodsReceipt GoodsReceipt?   @relation(fields: [goodsReceiptId], references: [id])
+  movements  StockMovement[]
+  transferDevices StockTransferDevice[]
+  returnItems  SalesReturnItem[]
+  shipmentDevices ShipmentDevice[]
+
+  @@index([businessId, status])
+  @@index([variantId, status])
+  @@index([warehouseId])
+}
+
+// ───────────────────────────── Warehouses & stock ─────────────────────────────
+
+model Warehouse {
+  id         String   @id @default(uuid())
+  businessId String
+  name       String
+  code       String
+  address    String?
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  business   Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  devices    Device[]
+  balances   InventoryBalance[]
+  movements  StockMovement[]
+  orders     SalesOrder[]
+  shipments  Shipment[]
+  transfersFrom StockTransfer[] @relation("TransferFrom")
+  transfersTo   StockTransfer[] @relation("TransferTo")
+  reservations  StockReservation[]
+
+  @@unique([businessId, code])
+}
+
+// Cached quantity per variant per warehouse. onHand counts quantity-tracked
+// stock only (accessories); phones live as Device rows. `reserved` is the sum
+// of ACTIVE quantity reservations. Always mutated inside a transaction
+// together with a StockMovement row.
+model InventoryBalance {
+  id          String   @id @default(uuid())
+  businessId  String
+  warehouseId String
+  variantId   String
+  onHand      Int      @default(0)
+  reserved    Int      @default(0)
+  updatedAt   DateTime @updatedAt
+
+  business  Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  warehouse Warehouse      @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([warehouseId, variantId])
+  @@index([businessId, variantId])
+}
+
+enum MovementType {
+  RECEIPT       // goods received from a supplier (+)
+  SALE          // fulfilled to a customer (-)
+  RESERVE       // moved onHand -> reserved (0 net, informational)
+  RELEASE       // reservation released (0 net)
+  TRANSFER_OUT  // dispatched to another warehouse (-)
+  TRANSFER_IN   // received from another warehouse (+)
+  ADJUSTMENT    // manual correction (+/-) with reason
+  RETURN        // customer return back into stock (+)
+  RETURN_OUT    // return sent back / quarantined out (-)
+}
+
+// Append-only stock ledger. Never UPDATE or DELETE rows.
+model StockMovement {
+  id          String       @id @default(uuid())
+  businessId  String
+  warehouseId String
+  variantId   String
+  deviceId    String?
+  type        MovementType
+  quantity    Int // signed; 0 allowed for RESERVE/RELEASE markers
+  refType     String? // e.g. "PurchaseOrder", "SalesOrder", "StockTransfer"
+  refId       String?
+  note        String?
+  createdById String?
+  createdAt   DateTime     @default(now())
+
+  business  Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  warehouse Warehouse      @relation(fields: [warehouseId], references: [id])
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+  device    Device?        @relation(fields: [deviceId], references: [id])
+
+  @@index([businessId, createdAt])
+  @@index([variantId, warehouseId])
+}
+
+enum ReservationStatus {
+  ACTIVE
+  RELEASED
+  CONSUMED // turned into a fulfilment
+}
+
+// Quantity reservation against a sales-order line (accessories).
+// Phone reservations are represented by Device.status = RESERVED.
+model StockReservation {
+  id          String            @id @default(uuid())
+  businessId  String
+  orderItemId String
+  warehouseId String
+  variantId   String
+  quantity    Int
+  status      ReservationStatus @default(ACTIVE)
+  createdAt   DateTime          @default(now())
+
+  business  Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  orderItem SalesOrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  warehouse Warehouse      @relation(fields: [warehouseId], references: [id])
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+
+  @@index([orderItemId, status])
+}
+
+// ───────────────────────────── Purchasing ─────────────────────────────
+
+model Supplier {
+  id         String   @id @default(uuid())
+  businessId String
+  name       String
+  phone      String?
+  email      String?
+  address    String?
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  business       Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  purchaseOrders PurchaseOrder[]
+  devices        Device[]
+
+  @@unique([businessId, name])
+}
+
+enum POStatus {
+  DRAFT
+  SUBMITTED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+model PurchaseOrder {
+  id          String   @id @default(uuid())
+  businessId  String
+  supplierId  String
+  poNumber    String
+  status      POStatus @default(DRAFT)
+  expectedAt  DateTime?
+  notes       String?
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  business Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  supplier Supplier          @relation(fields: [supplierId], references: [id])
+  items    PurchaseOrderItem[]
+  receipts GoodsReceipt[]
+
+  @@unique([businessId, poNumber])
+}
+
+model PurchaseOrderItem {
+  id              String   @id @default(uuid())
+  purchaseOrderId String
+  variantId       String
+  quantity        Int
+  receivedQty     Int      @default(0)
+  unitCost        Decimal  @db.Decimal(19, 4)
+
+  purchaseOrder PurchaseOrder  @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  variant       ProductVariant @relation(fields: [variantId], references: [id])
+  devices       Device[]
+  receiptItems  GoodsReceiptItem[]
+
+  @@index([purchaseOrderId])
+}
+
+// One physical receiving event against a PO (supports partial receiving).
+model GoodsReceipt {
+  id             String   @id @default(uuid())
+  businessId     String
+  purchaseOrderId String
+  warehouseId    String
+  receivedById   String?
+  note           String?
+  createdAt      DateTime @default(now())
+
+  business      Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  purchaseOrder PurchaseOrder      @relation(fields: [purchaseOrderId], references: [id])
+  items         GoodsReceiptItem[]
+  devices       Device[]
+}
+
+model GoodsReceiptItem {
+  id                 String @id @default(uuid())
+  goodsReceiptId     String
+  purchaseOrderItemId String
+  quantity           Int // accessories quantity; phone rows have quantity 1 per device
+
+  goodsReceipt      GoodsReceipt     @relation(fields: [goodsReceiptId], references: [id], onDelete: Cascade)
+  purchaseOrderItem PurchaseOrderItem @relation(fields: [purchaseOrderItemId], references: [id])
+}
+
+// ───────────────────────────── Customers & pricing ─────────────────────────────
+
+enum CustomerStatus {
+  ACTIVE
+  SUSPENDED
+  BLOCKED
+}
+
+model Customer {
+  id               String         @id @default(uuid())
+  businessId       String
+  code             String // short human code e.g. "CUST-001"
+  name             String
+  contactName      String?
+  phone            String?
+  email            String?
+  address          String?
+  status           CustomerStatus @default(ACTIVE)
+  creditLimit      Decimal        @default(0) @db.Decimal(19, 4)
+  paymentTermsDays Int            @default(0)
+  priceListId      String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  business    Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  priceList   PriceList?   @relation(fields: [priceListId], references: [id])
+  salesOrders SalesOrder[]
+  invoices    Invoice[]
+  returns     SalesReturn[]
+
+  @@unique([businessId, code])
+  @@index([businessId, status])
+}
+
+// A named price list; items are quantity break tiers (minQty -> unitPrice).
+model PriceList {
+  id         String   @id @default(uuid())
+  businessId String
+  name       String
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  business Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  items    PriceListItem[]
+  customers Customer[]
+
+  @@unique([businessId, name])
+}
+
+model PriceListItem {
+  id         String  @id @default(uuid())
+  priceListId String
+  variantId  String
+  minQty     Int
+  unitPrice  Decimal @db.Decimal(19, 4)
+
+  priceList PriceList      @relation(fields: [priceListId], references: [id], onDelete: Cascade)
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([priceListId, variantId, minQty])
+}
+
+// ───────────────────────────── Sales orders ─────────────────────────────
+
+enum OrderStatus {
+  DRAFT
+  SUBMITTED
+  CONFIRMED
+  PARTIALLY_FULFILLED
+  FULFILLED
+  INVOICED
+  CANCELLED
+}
+
+model SalesOrder {
+  id            String      @id @default(uuid())
+  businessId    String
+  customerId    String
+  warehouseId   String // fulfilment warehouse
+  orderNumber   String
+  status        OrderStatus @default(DRAFT)
+  orderDate     DateTime    @default(now())
+  notes         String?
+  subtotal      Decimal     @db.Decimal(19, 4)
+  discountTotal Decimal     @default(0) @db.Decimal(19, 4)
+  taxTotal      Decimal     @default(0) @db.Decimal(19, 4)
+  grandTotal    Decimal     @db.Decimal(19, 4)
+  createdById   String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  business  Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customer  Customer         @relation(fields: [customerId], references: [id])
+  warehouse Warehouse        @relation(fields: [warehouseId], references: [id])
+  items     SalesOrderItem[]
+  invoices  Invoice[]
+  shipments Shipment[]
+  returns   SalesReturn[]
+
+  @@unique([businessId, orderNumber])
+  @@index([businessId, status, createdAt])
+}
+
+model SalesOrderItem {
+  id           String  @id @default(uuid())
+  salesOrderId String
+  variantId    String
+  quantity     Int
+  fulfilledQty Int     @default(0)
+  unitPrice    Decimal @db.Decimal(19, 4)
+  discount     Decimal @default(0) @db.Decimal(19, 4) // absolute per-line discount
+  lineTotal    Decimal @db.Decimal(19, 4) // (unitPrice * quantity) - discount
+
+  salesOrder  SalesOrder         @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  variant     ProductVariant     @relation(fields: [variantId], references: [id])
+  reservations StockReservation[]
+  shipmentItems ShipmentItem[]
+  returnItems   SalesReturnItem[]
+
+  @@index([salesOrderId])
+}
+
+// ───────────────────────────── Invoices & payments ─────────────────────────────
+
+enum InvoiceStatus {
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+model Invoice {
+  id            String        @id @default(uuid())
+  businessId    String
+  salesOrderId  String
+  customerId    String
+  invoiceNumber String
+  status        InvoiceStatus @default(ISSUED)
+  issuedAt      DateTime      @default(now())
+  dueAt         DateTime?
+  subtotal      Decimal       @db.Decimal(19, 4)
+  taxTotal      Decimal       @default(0) @db.Decimal(19, 4)
+  total         Decimal       @db.Decimal(19, 4)
+  amountPaid    Decimal       @default(0) @db.Decimal(19, 4)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  business   Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id])
+  customer   Customer   @relation(fields: [customerId], references: [id])
+  payments   Payment[]
+
+  @@unique([businessId, invoiceNumber])
+  @@index([businessId, status, dueAt])
+}
+
+enum PaymentMethod {
+  CASH
+  MOBILE_MONEY
+  BANK_TRANSFER
+  CARD
+  OTHER
+}
+
+// A manually recorded payment. `reference` stores the external reference
+// (e.g. mobile-money txn id typed in by the cashier) — it is a record of what
+// the user claims, NOT provider-verified proof.
+model Payment {
+  id             String        @id @default(uuid())
+  businessId     String
+  invoiceId      String
+  amount         Decimal       @db.Decimal(19, 4)
+  method         PaymentMethod
+  reference      String?
+  note           String?
+  idempotencyKey String?
+  receivedById   String?
+  receivedAt     DateTime      @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  invoice  Invoice  @relation(fields: [invoiceId], references: [id])
+
+  @@unique([businessId, idempotencyKey])
+  @@index([invoiceId])
+}
+
+// ───────────────────────────── Transfers ─────────────────────────────
+
+enum TransferStatus {
+  DRAFT
+  DISPATCHED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+model StockTransfer {
+  id              String         @id @default(uuid())
+  businessId      String
+  fromWarehouseId String
+  toWarehouseId   String
+  transferNumber  String
+  status          TransferStatus @default(DRAFT)
+  note            String?
+  createdById     String?
+  dispatchedAt    DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  business      Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  fromWarehouse Warehouse            @relation("TransferFrom", fields: [fromWarehouseId], references: [id])
+  toWarehouse   Warehouse            @relation("TransferTo", fields: [toWarehouseId], references: [id])
+  items         StockTransferItem[]
+  devices       StockTransferDevice[]
+
+  @@unique([businessId, transferNumber])
+}
+
+model StockTransferItem {
+  id          String @id @default(uuid())
+  transferId  String
+  variantId   String
+  quantity    Int
+  receivedQty Int    @default(0)
+
+  transfer StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  variant  ProductVariant @relation(fields: [variantId], references: [id])
+}
+
+model StockTransferDevice {
+  id          String    @id @default(uuid())
+  transferId  String
+  deviceId    String
+  receivedAt  DateTime?
+
+  transfer StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  device   Device        @relation(fields: [deviceId], references: [id])
+
+  @@unique([transferId, deviceId])
+}
+
+// ───────────────────────────── Shipments ─────────────────────────────
+
+enum ShipmentStatus {
+  PICKING
+  DISPATCHED
+  DELIVERED
+  CANCELLED
+}
+
+model Shipment {
+  id             String         @id @default(uuid())
+  businessId     String
+  salesOrderId   String
+  warehouseId    String
+  shipmentNumber String
+  status         ShipmentStatus @default(PICKING)
+  carrier        String?
+  trackingRef    String?
+  dispatchedAt   DateTime?
+  deliveredAt    DateTime?
+  podReference   String? // proof-of-delivery reference
+  note           String?
+  createdById    String?
+  createdAt      DateTime       @default(now())
+
+  business   Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  salesOrder SalesOrder      @relation(fields: [salesOrderId], references: [id])
+  warehouse  Warehouse       @relation(fields: [warehouseId], references: [id])
+  items      ShipmentItem[]
+  devices    ShipmentDevice[]
+
+  @@unique([businessId, shipmentNumber])
+}
+
+model ShipmentItem {
+  id          String @id @default(uuid())
+  shipmentId  String
+  orderItemId String
+  quantity    Int
+
+  shipment  Shipment      @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  orderItem SalesOrderItem @relation(fields: [orderItemId], references: [id])
+}
+
+model ShipmentDevice {
+  id         String @id @default(uuid())
+  shipmentId String
+  deviceId   String
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  device   Device   @relation(fields: [deviceId], references: [id])
+
+  @@unique([shipmentId, deviceId])
+}
+
+// ───────────────────────────── Returns ─────────────────────────────
+
+enum ReturnStatus {
+  RECEIVED          // goods physically back, not yet inspected
+  UNDER_INSPECTION
+  CLOSED            // resolved (restocked/refunded/replaced)
+  REJECTED
+}
+
+enum InspectionOutcome {
+  PENDING
+  RESTOCK
+  QUARANTINE
+}
+
+model SalesReturn {
+  id           String       @id @default(uuid())
+  businessId   String
+  salesOrderId String
+  customerId   String
+  returnNumber String
+  status       ReturnStatus @default(RECEIVED)
+  reason       String
+  refundAmount Decimal?     @db.Decimal(19, 4)
+  createdById  String?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  business   Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  salesOrder SalesOrder       @relation(fields: [salesOrderId], references: [id])
+  customer   Customer         @relation(fields: [customerId], references: [id])
+  items      SalesReturnItem[]
+
+  @@unique([businessId, returnNumber])
+}
+
+model SalesReturnItem {
+  id                String            @id @default(uuid())
+  salesReturnId     String
+  orderItemId       String
+  quantity          Int
+  deviceId          String?
+  inspectionOutcome InspectionOutcome @default(PENDING)
+
+  salesReturn SalesReturn    @relation(fields: [salesReturnId], references: [id], onDelete: Cascade)
+  orderItem   SalesOrderItem @relation(fields: [orderItemId], references: [id])
+  device      Device?        @relation(fields: [deviceId], references: [id])
+}
+
+// ───────────────────────────── Audit / idempotency / counters ─────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  businessId String
+  userId     String?
+  action     String // e.g. "order.confirm", "payment.record"
+  entityType String
+  entityId   String
+  before     Json?
+  after      Json?
+  meta       Json?
+  createdAt  DateTime @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, entityType, entityId])
+  @@index([businessId, createdAt])
+}
+
+// Stores the first response for an idempotency key so retries return the
+// same result instead of executing twice.
+model IdempotencyKey {
+  id         String   @id @default(uuid())
+  businessId String
+  endpoint   String
+  key        String
+  statusCode Int?
+  response   Json?
+  createdAt  DateTime @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, endpoint, key])
+}
+
+// Per-business document numbering (SO, INV, PO, TRF, SHP, RET, GRN).
+// Incremented with SELECT ... FOR UPDATE semantics inside the creating tx.
+model DocumentCounter {
+  id         String @id @default(uuid())
+  businessId String
+  type       String
+  value      Int    @default(0)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, type])
+}

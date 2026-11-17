@@ -1,0 +1,25 @@
+# Render Blueprint — apply this in the Render dashboard ("New → Blueprint")
+# to create the backend web service with one click.
+services:
+  - type: web
+    name: stoku-api
+    runtime: docker
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: ./server
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BCRYPT_ROUNDS
+        value: "10"
+      - key: JWT_ACCESS_TTL
+        value: 15m
+      - key: REFRESH_TOKEN_TTL_DAYS
+        value: "30"
+      - key: DATABASE_URL
+        sync: false   # set in dashboard (Neon connection string)
+      - key: JWT_SECRET
+        sync: false   # generate: node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+      - key: CORS_ORIGINS
+        sync: false   # set to your Vercel URL, e.g. https://stoku.vercel.app
