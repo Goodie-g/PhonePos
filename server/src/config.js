@@ -14,7 +14,13 @@ export const config = {
   jwtSecret: required('JWT_SECRET'),
   jwtAccessTtl: process.env.JWT_ACCESS_TTL ?? '15m',
   refreshTokenTtlDays: Number(process.env.REFRESH_TOKEN_TTL_DAYS ?? 30),
-  port: Number(process.env.PORT ?? 4000),
+  port: (() => {
+    const raw = process.env.PORT;
+    const n = raw ? Number(raw) : NaN;
+    // Guard against empty strings / "0" / NaN — those would bind to a random
+    // ephemeral port (port 0) and break hosts like Render that detect the port.
+    return Number.isFinite(n) && n > 0 ? n : 4000;
+  })(),
   corsOrigins: (process.env.CORS_ORIGINS ?? 'http://localhost:8081')
     .split(',')
     .map((s) => s.trim())
