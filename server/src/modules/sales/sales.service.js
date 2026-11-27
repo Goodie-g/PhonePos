@@ -3,7 +3,7 @@ import { prisma, withTransaction } from '../../db.js';
 import { ApiError } from '../../utils/api-error.js';
 import { nextDocNumber, dec } from '../../utils/doc-number.js';
 import { writeAudit } from '../../utils/audit.js';
-import { adjustOnHand, reserve, releaseReserved } from '../../services/stock.js';
+import { adjustOnHand, reserve, releaseReserved, removeUnits } from '../../services/stock.js';
 
 const orderInclude = {
   customer: { select: { id: true, code: true, name: true, status: true } },
@@ -240,12 +240,11 @@ export const fulfilOrder = async ({ businessId, userId, id, body }) =>
           throw ApiError.unprocessable('DEVICE_STATE',
             'Some devices are not RESERVED for this order line (wrong device, or already sold)');
         }
-        for (const deviceId of deviceIds) {
-          await adjustOnHand(tx, {
-            businessId, warehouseId: order.warehouseId, variantId: item.variantId,
-            delta: -1, type: 'SALE', deviceId, refType: 'SalesOrder', refId: order.id, userId,
-          });
-        }
+        await removeUnits(tx, {
+          businessId, warehouseId: order.warehouseId, type: 'SALE',
+          refType: 'SalesOrder', refId: order.id, userId,
+          units: deviceIds.map((deviceId) => ({ variantId: item.variantId, quantity: 1, deviceId })),
+        });
         await tx.salesOrderItem.update({
           where: { id: item.id }, data: { fulfilledQty: { increment: deviceIds.length } },
         });

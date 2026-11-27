@@ -3,7 +3,7 @@ import { prisma, withTransaction } from '../../db.js';
 import { ApiError } from '../../utils/api-error.js';
 import { nextDocNumber } from '../../utils/doc-number.js';
 import { writeAudit } from '../../utils/audit.js';
-import { adjustOnHand } from '../../services/stock.js';
+import { adjustOnHand, addUnits, removeUnits } from '../../services/stock.js';
 
 const transferInclude = {
   fromWarehouse: { select: { id: true, name: true, code: true } },
@@ -85,24 +85,29 @@ export const dispatchTransfer = async ({ businessId, userId, id }) =>
       throw ApiError.unprocessable('INVALID_TRANSITION', `Cannot dispatch a transfer in status ${transfer.status}`);
     }
 
-    for (const item of transfer.items) {
-      await adjustOnHand(tx, {
-        businessId, warehouseId: transfer.fromWarehouseId, variantId: item.variantId,
-        delta: -item.quantity, type: 'TRANSFER_OUT', refType: 'StockTransfer', refId: id, userId,
-      });
-    }
-    for (const td of transfer.devices) {
+    await removeUnits(tx, {
+      businessId, warehouseId: transfer.fromWarehouseId, type: 'TRANSFER_OUT',
+      refType: 'StockTransfer', refId: id, userId,
+      units: [
+        ...transfer.items.map((item) => ({ variantId: item.variantId, quantity: item.quantity })),
+        ...transfer.devices.map((td) => ({ variantId: td.device.variantId, quantity: 1, deviceId: td.deviceId })),
+      ],
+    });
+    // Claim every device atomically (compare-and-set on the whole batch).
+    const dispatchDeviceIds = transfer.devices.map((td) => td.deviceId);
+    if (dispatchDeviceIds.length) {
       const claimed = await tx.device.updateMany({
-        where: { id: td.deviceId, businessId, status: 'AVAILABLE', warehouseId: transfer.fromWarehouseId },
+        where: { id: { in: dispatchDeviceIds }, businessId, status: 'AVAILABLE', warehouseId: transfer.fromWarehouseId },
         data: { status: 'IN_TRANSIT' },
       });
-      if (claimed.count === 0) {
-        throw ApiError.unprocessable('DEVICE_STATE', `Device ${td.device.imei1} is no longer available at the source`);
+      if (claimed.count !== dispatchDeviceIds.length) {
+        const stillAvailable = await tx.device.findMany({
+          where: { id: { in: dispatchDeviceIds }, status: 'AVAILABLE', warehouseId: transfer.fromWarehouseId },
+          select: { imei1: true },
+        });
+        const bad = transfer.devices.find((td) => !stillAvailable.some((d) => d.imei1 === td.device.imei1));
+        throw ApiError.unprocessable('DEVICE_STATE', `Device ${bad?.device?.imei1 ?? ''} is no longer available at the source`);
       }
-      await adjustOnHand(tx, {
-        businessId, warehouseId: transfer.fromWarehouseId, variantId: td.device.variantId,
-        delta: -1, type: 'TRANSFER_OUT', deviceId: td.deviceId, refType: 'StockTransfer', refId: id, userId,
-      });
     }
 
     const updated = await tx.stockTransfer.update({
@@ -139,23 +144,31 @@ export const receiveTransfer = async ({ businessId, userId, id, body }) =>
     }
 
     const transferDeviceIds = new Set(transfer.devices.map((d) => d.deviceId));
-    for (const deviceId of body.deviceIds ?? []) {
+    const requestedDeviceIds = body.deviceIds ?? [];
+    for (const deviceId of requestedDeviceIds) {
       if (!transferDeviceIds.has(deviceId)) throw ApiError.badRequest(`Device ${deviceId} is not part of this transfer`);
-      const device = await tx.device.findUniqueOrThrow({ where: { id: deviceId } });
+    }
+    if (requestedDeviceIds.length) {
+      const devices = await tx.device.findMany({
+        where: { id: { in: requestedDeviceIds } },
+        select: { id: true, imei1: true, variantId: true, status: true },
+      });
       const claimed = await tx.device.updateMany({
-        where: { id: deviceId, businessId, status: 'IN_TRANSIT' },
+        where: { id: { in: requestedDeviceIds }, businessId, status: 'IN_TRANSIT' },
         data: { status: 'AVAILABLE', warehouseId: transfer.toWarehouseId },
       });
-      if (claimed.count === 0) {
-        throw ApiError.unprocessable('DEVICE_STATE', `Device ${device.imei1} is not in transit (status: ${device.status})`);
+      if (claimed.count !== requestedDeviceIds.length) {
+        const bad = devices.find((d) => d.status !== 'IN_TRANSIT');
+        throw ApiError.unprocessable('DEVICE_STATE', `Device ${bad?.imei1 ?? ''} is not in transit (status: ${bad?.status ?? 'unknown'})`);
       }
       await tx.stockTransferDevice.updateMany({
-        where: { transferId: id, deviceId, receivedAt: null },
+        where: { transferId: id, deviceId: { in: requestedDeviceIds }, receivedAt: null },
         data: { receivedAt: new Date() },
       });
-      await adjustOnHand(tx, {
-        businessId, warehouseId: transfer.toWarehouseId, variantId: device.variantId,
-        delta: 1, type: 'TRANSFER_IN', deviceId, refType: 'StockTransfer', refId: id, userId,
+      await addUnits(tx, {
+        businessId, warehouseId: transfer.toWarehouseId, type: 'TRANSFER_IN',
+        refType: 'StockTransfer', refId: id, userId,
+        units: devices.map((d) => ({ variantId: d.variantId, quantity: 1, deviceId: d.id })),
       });
     }
 
@@ -193,28 +206,26 @@ export const cancelTransfer = async ({ businessId, userId, id }) =>
     }
 
     if (transfer.status !== 'DRAFT') {
-      for (const item of transfer.items) {
-        const outstanding = item.quantity - item.receivedQty;
-        if (outstanding > 0) {
-          await adjustOnHand(tx, {
-            businessId, warehouseId: transfer.fromWarehouseId, variantId: item.variantId,
-            delta: outstanding, type: 'TRANSFER_IN', refType: 'StockTransfer', refId: id,
-            note: 'Transfer cancelled — returned to source', userId,
-          });
-        }
-      }
-      for (const td of transfer.devices) {
-        if (td.receivedAt === null) {
-          await tx.device.updateMany({
-            where: { id: td.deviceId, businessId, status: 'IN_TRANSIT' },
-            data: { status: 'AVAILABLE' },
-          });
-          const device = await tx.device.findUniqueOrThrow({ where: { id: td.deviceId } });
-          await adjustOnHand(tx, {
-            businessId, warehouseId: transfer.fromWarehouseId, variantId: device.variantId,
-            delta: 1, type: 'TRANSFER_IN', deviceId: td.deviceId, refType: 'StockTransfer', refId: id,
-            note: 'Transfer cancelled — returned to source', userId,
-          });
+      await addUnits(tx, {
+        businessId, warehouseId: transfer.fromWarehouseId, type: 'TRANSFER_IN',
+        refType: 'StockTransfer', refId: id, note: 'Transfer cancelled — returned to source', userId,
+        units: [
+          ...transfer.items
+            .filter((item) => item.quantity - item.receivedQty > 0)
+            .map((item) => ({ variantId: item.variantId, quantity: item.quantity - item.receivedQty })),
+          ...transfer.devices
+            .filter((td) => td.receivedAt === null)
+            .map((td) => ({ variantId: td.device.variantId, quantity: 1, deviceId: td.deviceId })),
+        ],
+      });
+      const unreceivedIds = transfer.devices.filter((td) => td.receivedAt === null).map((td) => td.deviceId);
+      if (unreceivedIds.length) {
+        const returned = await tx.device.updateMany({
+          where: { id: { in: unreceivedIds }, businessId, status: 'IN_TRANSIT' },
+          data: { status: 'AVAILABLE' },
+        });
+        if (returned.count !== unreceivedIds.length) {
+          throw ApiError.unprocessable('DEVICE_STATE', 'Some devices are not in transit — refresh and retry');
         }
       }
     }

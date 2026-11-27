@@ -3,7 +3,7 @@ import { prisma, withTransaction } from '../../db.js';
 import { ApiError } from '../../utils/api-error.js';
 import { nextDocNumber } from '../../utils/doc-number.js';
 import { writeAudit } from '../../utils/audit.js';
-import { adjustOnHand } from '../../services/stock.js';
+import { adjustOnHand, addUnits } from '../../services/stock.js';
 
 const poInclude = {
   supplier: true,
@@ -138,54 +138,85 @@ export const receiveGoods = async ({ businessId, userId, id, body }) => {
       });
     }
 
-    // ── Phones: one Device row per handset; IMEI uniqueness enforced by DB ──
-    const perLineCount = new Map();
-    for (const d of body.devices) {
-      const poItem = itemsById.get(d.purchaseOrderItemId);
-      if (!poItem) throw ApiError.badRequest(`Item ${d.purchaseOrderItemId} is not part of this PO`);
-      if (poItem.variant.product.type !== 'PHONE') {
-        throw ApiError.badRequest(`Item ${d.purchaseOrderItemId} is quantity-based — receive it via items[]`);
-      }
-      perLineCount.set(poItem.id, (perLineCount.get(poItem.id) ?? 0) + 1);
-      const count = perLineCount.get(poItem.id);
-      const remaining = poItem.quantity - poItem.receivedQty;
-      if (count > remaining) {
-        throw ApiError.unprocessable('OVER_RECEIVE', `Cannot receive ${count} devices; only ${remaining} outstanding on this line`);
-      }
-      try {
-        const device = await tx.device.create({
-          data: {
-            businessId,
-            variantId: poItem.variantId,
-            warehouseId: warehouse.id,
-            imei1: d.imei1,
-            imei2: d.imei2 ?? null,
-            serialNumber: d.serialNumber ?? null,
-            status: 'RECEIVED',
-            acquisitionCost: d.acquisitionCost ?? poItem.unitCost,
-            supplierId: po.supplierId,
-            purchaseItemId: poItem.id,
-            goodsReceiptId: receipt.id,
-            warrantyMonths: d.warrantyMonths ?? null,
-          },
-        });
-        await adjustOnHand(tx, {
-          businessId, warehouseId: warehouse.id, variantId: poItem.variantId,
-          delta: 1, type: 'RECEIPT', deviceId: device.id, refType: 'PurchaseOrder', refId: po.id, userId,
-        });
-        await tx.purchaseOrderItem.update({
-          where: { id: poItem.id }, data: { receivedQty: { increment: 1 } },
-        });
-        await tx.goodsReceiptItem.create({
-          data: { goodsReceiptId: receipt.id, purchaseOrderItemId: poItem.id, quantity: 1 },
-        });
-      } catch (err) {
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-          throw ApiError.conflict(`Duplicate IMEI: ${d.imei1}${d.imei2 ? ` / ${d.imei2}` : ''} is already registered`);
+      // ── Phones: batched registration. Validate counts up-front, then bulk
+      // queries (createMany devices, one balance upsert per variant, one
+      // createMany ledger + receipt rows) instead of 4 queries per handset.
+      const perLine = new Map();
+      for (const d of body.devices) {
+        const poItem = itemsById.get(d.purchaseOrderItemId);
+        if (!poItem) throw ApiError.badRequest(`Item ${d.purchaseOrderItemId} is not part of this PO`);
+        if (poItem.variant.product.type !== 'PHONE') {
+          throw ApiError.badRequest(`Item ${d.purchaseOrderItemId} is quantity-based — receive it via items[]`);
         }
-        throw err;
+        const entry = perLine.get(poItem.id) ?? { poItem, devices: [] };
+        const remaining = poItem.quantity - poItem.receivedQty;
+        if (entry.devices.length + 1 > remaining) {
+          throw ApiError.unprocessable('OVER_RECEIVE', `Cannot receive more than ${remaining} devices outstanding on this line`);
+        }
+        entry.devices.push(d);
+        perLine.set(poItem.id, entry);
       }
-    }
+
+      if (perLine.size > 0) {
+        const rows = [];
+        for (const { poItem, devices } of perLine.values()) {
+          for (const d of devices) {
+            rows.push({
+              businessId,
+              variantId: poItem.variantId,
+              warehouseId: warehouse.id,
+              imei1: d.imei1,
+              imei2: d.imei2 ?? null,
+              serialNumber: d.serialNumber ?? null,
+              status: 'RECEIVED',
+              acquisitionCost: d.acquisitionCost ?? poItem.unitCost,
+              supplierId: po.supplierId,
+              purchaseItemId: poItem.id,
+              goodsReceiptId: receipt.id,
+              warrantyMonths: d.warrantyMonths ?? null,
+              purchaseOrderItemId: poItem.id,
+            });
+          }
+        }
+        try {
+          await tx.device.createMany({ data: rows.map(({ purchaseOrderItemId, ...device }) => device) });
+        } catch (err) {
+          if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+            const seen = new Set();
+            let duplicate = '';
+            for (const row of rows) {
+              if (seen.has(row.imei1)) { duplicate = row.imei1; break; }
+              seen.add(row.imei1);
+            }
+            throw ApiError.conflict(`Duplicate IMEI: ${duplicate} is already registered`);
+          }
+          throw err;
+        }
+
+        const createdDevices = await tx.device.findMany({
+          where: { imei1: { in: rows.map((row) => row.imei1) } },
+          select: { id: true, imei1: true, variantId: true },
+        });
+        const idByImei = new Map(createdDevices.map((d) => [d.imei1, d.id]));
+
+        await addUnits(tx, {
+          businessId, warehouseId: warehouse.id, type: 'RECEIPT',
+          refType: 'PurchaseOrder', refId: po.id, userId,
+          units: rows.map((row) => ({
+            variantId: row.variantId, quantity: 1, deviceId: idByImei.get(row.imei1),
+          })),
+        });
+        await tx.goodsReceiptItem.createMany({
+          data: rows.map((row) => ({
+            goodsReceiptId: receipt.id, purchaseOrderItemId: row.purchaseOrderItemId, quantity: 1,
+          })),
+        });
+        for (const { poItem, devices } of perLine.values()) {
+          await tx.purchaseOrderItem.update({
+            where: { id: poItem.id }, data: { receivedQty: { increment: devices.length } },
+          });
+        }
+      }
 
     // Recompute PO status from the accumulated received quantities.
     const refreshed = await tx.purchaseOrder.findUniqueOrThrow({

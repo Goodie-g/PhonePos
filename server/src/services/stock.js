@@ -45,6 +45,69 @@ export const adjustOnHand = async (
   });
 };
 
+/** Batched inbound (receiving): one balance upsert per (warehouse, variant) plus
+ *  ONE createMany for the ledger rows — same invariants as adjustOnHand but
+ *  ~N/10 the round trips, which matters on high-latency managed databases.
+ *  units: [{ variantId, quantity, deviceId? }] (quantity defaults to 1). */
+export const addUnits = async (
+  tx,
+  { businessId, warehouseId, units, type, refType = null, refId = null, note = null, userId = null }
+) => {
+  if (!units?.length) return;
+  const perVariant = new Map();
+  for (const unit of units) {
+    if (!unit.quantity || unit.quantity <= 0) throw new Error('addUnits requires positive quantities');
+    perVariant.set(unit.variantId, (perVariant.get(unit.variantId) ?? 0) + unit.quantity);
+  }
+  for (const [variantId, total] of perVariant) {
+    await tx.inventoryBalance.upsert({
+      where: { warehouseId_variantId: { warehouseId, variantId } },
+      create: { businessId, warehouseId, variantId, onHand: total },
+      update: { onHand: { increment: total } },
+    });
+  }
+  await tx.stockMovement.createMany({
+    data: units.map((unit) => ({
+      businessId, warehouseId, variantId: unit.variantId, deviceId: unit.deviceId ?? null,
+      type, quantity: unit.quantity, refType, refId, note, createdById: userId,
+    })),
+  });
+};
+
+/** Batched outbound (fulfilment, transfer dispatch): one conditional UPDATE per
+ *  (warehouse, variant) — stock can still never go negative — plus one createMany
+ *  for the per-unit ledger rows. */
+export const removeUnits = async (
+  tx,
+  { businessId, warehouseId, units, type, refType = null, refId = null, note = null, userId = null }
+) => {
+  if (!units?.length) return;
+  const perVariant = new Map();
+  for (const unit of units) {
+    if (!unit.quantity || unit.quantity <= 0) throw new Error('removeUnits requires positive quantities');
+    perVariant.set(unit.variantId, (perVariant.get(unit.variantId) ?? 0) + unit.quantity);
+  }
+  for (const [variantId, total] of perVariant) {
+    const result = await tx.inventoryBalance.updateMany({
+      where: { warehouseId, variantId, businessId, onHand: { gte: total } },
+      data: { onHand: { increment: -total } },
+    });
+    if (result.count === 0) {
+      throw ApiError.unprocessable('INSUFFICIENT_STOCK', 'Insufficient stock at this warehouse', {
+        variantId,
+        warehouseId,
+        requested: total,
+      });
+    }
+  }
+  await tx.stockMovement.createMany({
+    data: units.map((unit) => ({
+      businessId, warehouseId, variantId: unit.variantId, deviceId: unit.deviceId ?? null,
+      type, quantity: unit.quantity, refType, refId, note, createdById: userId,
+    })),
+  });
+};
+
 /**
  * Reserve `amount` units (onHand - reserved >= amount must hold).
  * Raw SQL so the availability check and the increment are ONE atomic UPDATE:
