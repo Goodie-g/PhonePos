@@ -79,3 +79,44 @@ SECURITY, LOCAL_SETUP, LEARNING_GUIDE).
 ## Last verified checkpoint
 
 All stages complete; tests green, TS green, web export green.
+
+## Deployment status (Nov 27, 2026)
+
+**Live and verified:**
+- Frontend: https://phone-pos.vercel.app (Expo web static export on Vercel,
+  `EXPO_PUBLIC_API_URL` baked in at build time, deployed via Git auto-deploy).
+- Backend: https://stoku-api.onrender.com (Render Docker service, auto-deploy on
+  push, health at `/api/health`, CORS allow-list includes the frontend).
+- Database: Neon free-tier Postgres, schema migrated, demo-seeded
+  (2 businesses, 57 devices, 82 ledger movements, 3 orders).
+- End-to-end verified in a browser: login → dashboard (TSh 4,277,500 revenue,
+  2,000,000 cash, 2,277,500 outstanding, 40 available devices) → inventory
+  catalogue. Tenant-isolation demo login: `baraka@kiligadgets.co.tz`.
+
+**Deployment bugs found and fixed (all in code, all pushed):**
+1. Port binding to 0 when Render's `PORT` is empty → robust parsing (d064cdb).
+2. CORS middleware threw on unknown origins → 500s + process crash; now rejects
+   by omitting headers, and the allow-list merges defaults with `CORS_ORIGINS`
+   plus `*.vercel.app` previews of the demo project (3676616).
+3. `trust proxy` unset → express-rate-limit mis-read client IPs behind Render.
+4. Prisma 5s interactive-transaction default → all transactions now use a
+   15s wait / 30s run budget (86fda06).
+5. Seed/health-check race: app now listens BEFORE background-seeding an empty
+   database (`SEED_ON_EMPTY_DB=false` to disable).
+6. `prisma migrate deploy` advisory-lock timeout (P1002) on Neon: migrations now
+   run against Neon's *direct* host (auto-derived by stripping `-pooler` from
+   the hostname, or set `MIGRATION_URL`), with one retry (47cd29f/643ba6b).
+7. Neon's pgbouncer host also breaks the APP's interactive transactions
+   (`Transaction not found`) — `start.sh` derives the direct host for the app
+   as well (462e57c).
+8. Per-device query loops (receiving, fulfilment, transfers) did 2-4 round trips
+   per handset (~140 queries to receive 35 phones) — replaced with batched
+   `addUnits`/`removeUnits` in `services/stock.js` (~15 queries). Same
+   invariants: conditional updates, append-only ledger, 25/25 tests pass.
+
+**Honest caveats for the deployed demo:**
+- Neon free compute + long network routes mean ~300ms per query; the boot seed
+  takes minutes when it runs (only on a truly empty database). APIs work fine.
+- Render free tier sleeps after ~15 min idle (first request can take ~50s).
+- `server/prisma/reset.js` (`npm run db:reset`) empties tables without dropping
+  the schema; then restart the API to reseed, or run `npm run seed`.
