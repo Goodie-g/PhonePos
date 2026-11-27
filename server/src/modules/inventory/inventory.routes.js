@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { ApiError, ah } from '../../utils/api-error.js';
 import { validate } from '../../middleware/validate.js';
 import { authenticate } from '../../middleware/authenticate.js';
@@ -105,7 +105,7 @@ inventoryRoutes.post('/adjustments', requirePermission('inventory:adjust'),
       throw ApiError.badRequest('Phones are unit-tracked — adjust via device operations, not quantities');
     }
 
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await withTransaction(async (tx) => {
       await adjustOnHand(tx, {
         businessId: req.businessId, warehouseId, variantId, delta,
         type: 'ADJUSTMENT', note: reason, userId: req.user.id,

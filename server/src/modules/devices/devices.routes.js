@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { ApiError, ah } from '../../utils/api-error.js';
 import { validate } from '../../middleware/validate.js';
 import { authenticate } from '../../middleware/authenticate.js';
@@ -59,7 +59,7 @@ devicesRoutes.get('/:id', requirePermission('devices:read'), ah(async (req, res)
 // is driven by orders, transfers and returns.
 devicesRoutes.post('/:id/mark-available', requirePermission('devices:manage'),
   ah(async (req, res) => {
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await withTransaction(async (tx) => {
       // Atomic compare-and-set on status (no race between two users).
       const updated = await tx.device.updateMany({
         where: { id: req.params.id, businessId: req.businessId, status: 'RECEIVED' },

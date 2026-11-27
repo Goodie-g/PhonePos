@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { ApiError, ah } from '../../utils/api-error.js';
 import { validate } from '../../middleware/validate.js';
 import { authenticate } from '../../middleware/authenticate.js';
@@ -62,7 +62,7 @@ shipmentsRoutes.get('/:id', requirePermission('shipments:read'), ah(async (req, 
 shipmentsRoutes.post('/', requirePermission('shipments:manage'),
   validate({ body: createSchema }),
   ah(async (req, res) => {
-    const data = await prisma.$transaction(async (tx) => {
+    const data = await withTransaction(async (tx) => {
       const order = await tx.salesOrder.findFirst({
         where: { id: req.body.salesOrderId, businessId: req.businessId },
         include: { items: true },
@@ -124,7 +124,7 @@ shipmentsRoutes.post('/', requirePermission('shipments:manage'),
   }));
 
 const transition = (fromStatuses, to, extra = {}) => async (req, res) => {
-  const data = await prisma.$transaction(async (tx) => {
+  const data = await withTransaction(async (tx) => {
     const shipment = await tx.shipment.findFirst({ where: { id: req.params.id, businessId: req.businessId } });
     if (!shipment) throw ApiError.notFound('Shipment not found');
     if (!fromStatuses.includes(shipment.status)) {

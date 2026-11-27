@@ -26,6 +26,10 @@ import { auditRoutes } from './modules/audit/audit.routes.js';
 export const createApp = () => {
   const app = express();
 
+  // Render/Railway/Fly terminate TLS in front of the app: trust the first proxy
+  // hop so rate limiting sees the real client IP instead of the proxy's.
+  if (config.isProd) app.set('trust proxy', 1);
+
   // Vercel preview deployments of the demo frontend (phone-pos-<hash>-<team>.vercel.app).
   const isPreviewOrigin = (origin) => /^https:\/\/phone-pos(-[a-z0-9-]+)*\.vercel\.app$/i.test(origin);
   const isAllowedOrigin = (origin) => config.corsOrigins.includes(origin) || isPreviewOrigin(origin);

@@ -1,5 +1,5 @@
 import { Prisma } from '@prisma/client';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { ApiError } from '../../utils/api-error.js';
 import { nextDocNumber, dec } from '../../utils/doc-number.js';
 import { writeAudit } from '../../utils/audit.js';
@@ -25,7 +25,7 @@ export const getInvoiceOrThrow = async (db, businessId, id) => {
  *  - credit limit: outstanding balance + new total must not exceed the limit.
  */
 export const createInvoice = async ({ businessId, userId, salesOrderId }) =>
-  prisma.$transaction(async (tx) => {
+  withTransaction(async (tx) => {
     const order = await tx.salesOrder.findFirst({
       where: { id: salesOrderId, businessId },
       include: { customer: true, invoices: { where: { status: { not: 'VOID' } } } },
@@ -80,7 +80,7 @@ export const createInvoice = async ({ businessId, userId, salesOrderId }) =>
  * so two simultaneous payments cannot both push amountPaid past the total.
  */
 export const recordPayment = async ({ businessId, userId, invoiceId, body, idempotencyKey }) =>
-  prisma.$transaction(async (tx) => {
+  withTransaction(async (tx) => {
     // Lock the invoice row first (SELECT ... FOR UPDATE).
     const [locked] = await tx.$queryRaw`
       SELECT "id" FROM "Invoice" WHERE "id" = ${invoiceId} AND "businessId" = ${businessId} FOR UPDATE`;
@@ -129,7 +129,7 @@ export const recordPayment = async ({ businessId, userId, invoiceId, body, idemp
   }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
 export const voidInvoice = async ({ businessId, userId, id }) =>
-  prisma.$transaction(async (tx) => {
+  withTransaction(async (tx) => {
     const invoice = await getInvoiceOrThrow(tx, businessId, id);
     if (invoice.status === 'VOID') throw ApiError.unprocessable('INVALID_STATE', 'Invoice is already void');
     if (dec(invoice.amountPaid).gt(0)) {

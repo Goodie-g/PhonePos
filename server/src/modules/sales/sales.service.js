@@ -1,5 +1,5 @@
 import { Prisma } from '@prisma/client';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { ApiError } from '../../utils/api-error.js';
 import { nextDocNumber, dec } from '../../utils/doc-number.js';
 import { writeAudit } from '../../utils/audit.js';
@@ -70,7 +70,7 @@ export const createOrder = async ({ businessId, userId, body }) => {
 
   const business = await prisma.business.findUniqueOrThrow({ where: { id: businessId } });
 
-  return prisma.$transaction(async (tx) => {
+  return withTransaction(async (tx) => {
     const variantById = new Map(variants.map((v) => [v.id, v]));
     let subtotal = dec(0);
     let discountTotal = dec(0);
@@ -113,7 +113,7 @@ export const createOrder = async ({ businessId, userId, body }) => {
 };
 
 export const submitOrder = async ({ businessId, userId, id }) =>
-  prisma.$transaction(async (tx) => {
+  withTransaction(async (tx) => {
     const order = await getOrderOrThrow(tx, businessId, id);
     if (order.status !== 'DRAFT') {
       throw ApiError.unprocessable('INVALID_TRANSITION', `Cannot submit an order in status ${order.status}`);
@@ -133,7 +133,7 @@ export const submitOrder = async ({ businessId, userId, id }) =>
  *    (compare-and-set), so two concurrent confirms cannot grab the same handset.
  */
 export const confirmOrder = async ({ businessId, userId, id }) =>
-  prisma.$transaction(async (tx) => {
+  withTransaction(async (tx) => {
     const order = await getOrderOrThrow(tx, businessId, id);
     if (order.status !== 'SUBMITTED') {
       throw ApiError.unprocessable('INVALID_TRANSITION', `Cannot confirm an order in status ${order.status}`);
@@ -190,7 +190,7 @@ export const confirmOrder = async ({ businessId, userId, id }) =>
  * Phones: the specified devices must be RESERVED for this order line -> SOLD.
  */
 export const fulfilOrder = async ({ businessId, userId, id, body }) =>
-  prisma.$transaction(async (tx) => {
+  withTransaction(async (tx) => {
     const order = await getOrderOrThrow(tx, businessId, id);
     if (!['CONFIRMED', 'PARTIALLY_FULFILLED'].includes(order.status)) {
       throw ApiError.unprocessable('INVALID_STATE', `Cannot fulfil an order in status ${order.status}`);
@@ -268,7 +268,7 @@ export const fulfilOrder = async ({ businessId, userId, id, body }) =>
 
 /** Cancel releases every remaining reservation. Not allowed once fulfilment started. */
 export const cancelOrder = async ({ businessId, userId, id }) =>
-  prisma.$transaction(async (tx) => {
+  withTransaction(async (tx) => {
     const order = await getOrderOrThrow(tx, businessId, id);
     if (!['DRAFT', 'SUBMITTED', 'CONFIRMED'].includes(order.status)) {
       throw ApiError.unprocessable('INVALID_TRANSITION',

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { ApiError, ah } from '../../utils/api-error.js';
 import { validate } from '../../middleware/validate.js';
 import { authenticate } from '../../middleware/authenticate.js';
@@ -29,7 +29,7 @@ pricingRoutes.get('/', requirePermission('pricelists:read'), ah(async (req, res)
 pricingRoutes.post('/', requirePermission('pricelists:manage'),
   validate({ body: priceListSchema }),
   ah(async (req, res) => {
-    const data = await prisma.$transaction(async (tx) => {
+    const data = await withTransaction(async (tx) => {
       if (req.body.isDefault) {
         await tx.priceList.updateMany({
           where: { businessId: req.businessId, isDefault: true }, data: { isDefault: false },

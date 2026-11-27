@@ -1,5 +1,5 @@
 import { Prisma } from '@prisma/client';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { ApiError } from '../../utils/api-error.js';
 import { nextDocNumber } from '../../utils/doc-number.js';
 import { writeAudit } from '../../utils/audit.js';
@@ -36,7 +36,7 @@ export const createPurchaseOrder = async ({ businessId, userId, body }) => {
     throw ApiError.badRequest('One or more variants do not belong to this business');
   }
 
-  return prisma.$transaction(async (tx) => {
+  return withTransaction(async (tx) => {
     const poNumber = await nextDocNumber(tx, businessId, 'purchaseOrder');
     const po = await tx.purchaseOrder.create({
       data: {
@@ -72,7 +72,7 @@ const ALLOWED_TRANSITIONS = {
 };
 
 export const transitionPO = async ({ businessId, userId, id, action }) => {
-  return prisma.$transaction(async (tx) => {
+  return withTransaction(async (tx) => {
     const po = await getPOOrThrow(tx, businessId, id);
     const next = action === 'submit' ? 'SUBMITTED' : 'CANCELLED';
     if (!ALLOWED_TRANSITIONS[po.status].includes(next)) {
@@ -99,7 +99,7 @@ export const transitionPO = async ({ businessId, userId, id, action }) => {
  * PO status update and the audit entry commit together or not at all.
  */
 export const receiveGoods = async ({ businessId, userId, id, body }) => {
-  return prisma.$transaction(async (tx) => {
+  return withTransaction(async (tx) => {
     const po = await getPOOrThrow(tx, businessId, id);
     if (!['SUBMITTED', 'PARTIALLY_RECEIVED'].includes(po.status)) {
       throw ApiError.unprocessable('INVALID_STATE', `Cannot receive against a PO in status ${po.status}`);

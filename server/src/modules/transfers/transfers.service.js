@@ -1,5 +1,5 @@
 import { Prisma } from '@prisma/client';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { ApiError } from '../../utils/api-error.js';
 import { nextDocNumber } from '../../utils/doc-number.js';
 import { writeAudit } from '../../utils/audit.js';
@@ -28,7 +28,7 @@ export const createTransfer = async ({ businessId, userId, body }) => {
   ]);
   if (!from || !to) throw ApiError.badRequest('Unknown or inactive warehouse');
 
-  return prisma.$transaction(async (tx) => {
+  return withTransaction(async (tx) => {
     // Validate accessory items.
     const variantIds = (body.items ?? []).map((i) => i.variantId);
     if (variantIds.length > 0) {
@@ -79,7 +79,7 @@ export const createTransfer = async ({ businessId, userId, body }) => {
  * in transit until receive() confirms them.
  */
 export const dispatchTransfer = async ({ businessId, userId, id }) =>
-  prisma.$transaction(async (tx) => {
+  withTransaction(async (tx) => {
     const transfer = await getTransferOrThrow(tx, businessId, id);
     if (transfer.status !== 'DRAFT') {
       throw ApiError.unprocessable('INVALID_TRANSITION', `Cannot dispatch a transfer in status ${transfer.status}`);
@@ -117,7 +117,7 @@ export const dispatchTransfer = async ({ businessId, userId, id }) =>
 
 /** Receive (fully or partially). May be called repeatedly until complete. */
 export const receiveTransfer = async ({ businessId, userId, id, body }) =>
-  prisma.$transaction(async (tx) => {
+  withTransaction(async (tx) => {
     const transfer = await getTransferOrThrow(tx, businessId, id);
     if (!['DISPATCHED', 'PARTIALLY_RECEIVED'].includes(transfer.status)) {
       throw ApiError.unprocessable('INVALID_TRANSITION', `Cannot receive a transfer in status ${transfer.status}`);
@@ -186,7 +186,7 @@ export const receiveTransfer = async ({ businessId, userId, id, body }) =>
  * reason — so the ledger always explains every unit.
  */
 export const cancelTransfer = async ({ businessId, userId, id }) =>
-  prisma.$transaction(async (tx) => {
+  withTransaction(async (tx) => {
     const transfer = await getTransferOrThrow(tx, businessId, id);
     if (!['DRAFT', 'DISPATCHED', 'PARTIALLY_RECEIVED'].includes(transfer.status)) {
       throw ApiError.unprocessable('INVALID_TRANSITION', `Cannot cancel a transfer in status ${transfer.status}`);

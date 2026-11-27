@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { ApiError, ah } from '../../utils/api-error.js';
 import { validate } from '../../middleware/validate.js';
 import { authenticate } from '../../middleware/authenticate.js';
@@ -60,7 +60,7 @@ customersRoutes.post('/', requirePermission('customers:manage'),
       });
       if (!pl) throw ApiError.badRequest('Unknown price list');
     }
-    const data = await prisma.$transaction(async (tx) => {
+    const data = await withTransaction(async (tx) => {
       const code = await nextDocNumber(tx, req.businessId, 'customer');
       return tx.customer.create({ data: { ...req.body, code, businessId: req.businessId } });
     });

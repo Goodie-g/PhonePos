@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { config } from '../../config.js';
 import { ApiError, ah } from '../../utils/api-error.js';
 import { validate } from '../../middleware/validate.js';
@@ -34,7 +34,7 @@ usersRoutes.post(
   validate({ body: inviteSchema }),
   ah(async (req, res) => {
     const email = req.body.email.toLowerCase();
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await withTransaction(async (tx) => {
       let user = await tx.user.findUnique({ where: { email } });
       if (!user) {
         user = await tx.user.create({
@@ -86,7 +86,7 @@ usersRoutes.patch(
     if (!membership) throw ApiError.notFound('Membership not found');
     if (membership.role === 'OWNER') throw ApiError.forbidden('The owner cannot be modified');
 
-    const updated = await prisma.$transaction(async (tx) => {
+    const updated = await withTransaction(async (tx) => {
       const m = await tx.membership.update({
         where: { id: membership.id },
         data: { role: req.body.role ?? membership.role },

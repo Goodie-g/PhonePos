@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { ApiError, ah } from '../../utils/api-error.js';
 import { validate } from '../../middleware/validate.js';
 import { authenticate } from '../../middleware/authenticate.js';
@@ -64,7 +64,7 @@ returnsRoutes.get('/:id', requirePermission('returns:read'), ah(async (req, res)
 returnsRoutes.post('/', requirePermission('returns:manage'),
   validate({ body: createSchema }),
   ah(async (req, res) => {
-    const data = await prisma.$transaction(async (tx) => {
+    const data = await withTransaction(async (tx) => {
       const order = await tx.salesOrder.findFirst({
         where: { id: req.body.salesOrderId, businessId: req.businessId },
         include: { items: { include: { variant: { include: { product: true } } } } },
@@ -142,7 +142,7 @@ const inspectSchema = z.object({
 returnsRoutes.post('/:id/inspect', requirePermission('returns:inspect'),
   validate({ body: inspectSchema }),
   ah(async (req, res) => {
-    const data = await prisma.$transaction(async (tx) => {
+    const data = await withTransaction(async (tx) => {
       const salesReturn = await tx.salesReturn.findFirst({
         where: { id: req.params.id, businessId: req.businessId },
         include: { items: { include: { orderItem: true, device: true } }, salesOrder: true },
@@ -216,7 +216,7 @@ returnsRoutes.post('/:id/inspect', requirePermission('returns:inspect'),
 returnsRoutes.post('/:id/refund', requirePermission('returns:manage'),
   validate({ body: z.object({ amount: z.coerce.number().positive() }) }),
   ah(async (req, res) => {
-    const data = await prisma.$transaction(async (tx) => {
+    const data = await withTransaction(async (tx) => {
       const salesReturn = await tx.salesReturn.findFirst({ where: { id: req.params.id, businessId: req.businessId } });
       if (!salesReturn) throw ApiError.notFound('Return not found');
       if (salesReturn.refundAmount) throw ApiError.conflict('A refund was already recorded for this return');

@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { config } from '../../config.js';
-import { prisma } from '../../db.js';
+import { prisma, withTransaction } from '../../db.js';
 import { ApiError } from '../../utils/api-error.js';
 
 /**
@@ -51,7 +51,7 @@ export const registerBusiness = async ({ email, password, fullName, businessName
 
   const passwordHash = await bcrypt.hash(password, config.bcryptRounds);
 
-  const user = await prisma.$transaction(async (tx) => {
+  const user = await withTransaction(async (tx) => {
     const created = await tx.user.create({
       data: { email: normalizedEmail, passwordHash, fullName },
     });
@@ -108,7 +108,7 @@ export const refresh = async ({ refreshToken }, req) => {
   const newToken = crypto.randomBytes(48).toString('base64url');
   const expiresAt = new Date(Date.now() + config.refreshTokenTtlDays * 24 * 60 * 60 * 1000);
 
-  await prisma.$transaction(async (tx) => {
+  await withTransaction(async (tx) => {
     const replacement = await tx.refreshToken.create({
       data: {
         userId: stored.userId,
