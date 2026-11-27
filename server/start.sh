@@ -9,7 +9,8 @@ set -e
 MIGRATION_URL="${MIGRATION_URL:-$(printf '%s' "$DATABASE_URL" | sed 's/-pooler\././')}"
 
 # One retry: cold Postgres instances occasionally refuse the first lock attempt.
-npx prisma migrate deploy --url "$MIGRATION_URL" \
-  || { echo "migrate deploy failed once — retrying in 5s"; sleep 5; npx prisma migrate deploy --url "$MIGRATION_URL"; }
+# Prisma reads the URL from DATABASE_URL (migrate deploy has no --url flag).
+DATABASE_URL="$MIGRATION_URL" npx prisma migrate deploy \
+  || { echo "migrate deploy failed once — retrying in 5s"; sleep 5; DATABASE_URL="$MIGRATION_URL" npx prisma migrate deploy; }
 
 exec node src/index.js

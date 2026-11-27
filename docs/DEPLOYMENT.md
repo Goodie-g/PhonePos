@@ -45,27 +45,38 @@ A `server/Dockerfile` is included. On Render:
    - Build command: `npm install && npx prisma generate && npx prisma migrate deploy`
    - Start command: `node src/index.js`
 4. **Environment variables** (set in the Render dashboard — never in git):
-   - `DATABASE_URL` = Neon connection string
+   - `DATABASE_URL` = Neon connection string — **use the pooled URL** (contains
+     `-pooler`) for the running app.
    - `JWT_SECRET` = the long random string from step 1.2
    - `JWT_ACCESS_TTL` = `15m`
    - `REFRESH_TOKEN_TTL_DAYS` = `30`
    - `PORT` = (Render sets this automatically; leave unset or `10000`)
-   - `CORS_ORIGINS` = your frontend URL, e.g. `https://stoku.vercel.app`
+   - `CORS_ORIGINS` = extra allowed origins; the defaults already include
+     `http://localhost:8081` (Expo dev) and the deployed demo frontend
+     (`https://phone-pos.vercel.app`), plus any `*.vercel.app` preview of that
+     project. Unknown origins are rejected by *omitting* CORS headers (no 500s).
    - `BCRYPT_ROUNDS` = `10`
    - `NODE_ENV` = `production`
+   - `MIGRATION_URL` (optional) = direct (non-pooled) database URL used for
+     migrations only. If unset, the start script derives it automatically by
+     stripping `-pooler` from the host — required because `prisma migrate
+     deploy` holds a session-level advisory lock that Neon's PgBouncer cannot.
 5. **Health check path**: `/api/health`.
-6. Deploy. Watch the build log — `prisma migrate deploy` runs on every deploy,
-   so schema changes ship automatically.
+6. Deploy. The start script (`server/start.sh`) runs `prisma migrate deploy`
+   (with one retry) before starting Node.
 
-### Seed the demo data (once, after first deploy)
+### Seed the demo data
 
-Render → Shell (or run locally pointed at the prod DB):
-```bash
-cd server
-DATABASE_URL="<neon url>" npm run seed
-```
-This creates the two demo businesses + logins + IMEI stock + orders. Re-running
-is a no-op (seed skips when businesses exist).
+The container seeds automatically: on boot, if the database has **no businesses**,
+it runs the idempotent demo seed in the background (`SEED_ON_EMPTY_DB=false` to
+disable). A fresh deploy is therefore usable without any manual step.
+
+To wipe and re-seed an existing deployment:
+
+1. Render → service → **Shell**: `node prisma/reset.js` (empties all tables).
+2. Restart the service — boot detects the empty DB and seeds.
+
+Locally: `npm run db:reset` in `server/`, then `npm run seed`.
 
 ### Important: free-tier sleep
 
@@ -94,8 +105,7 @@ match. Free HTTPS is automatic.
 ## Step 4 — Verify the deployed demo
 
 1. Open the frontend URL → log in with `neema@uhuruphones.co.tz` / `Stoku2026!`.
-2. Check the dashboard loads real numbers (not zeros) — confirms DB + seed.
-3. Create a test order end-to-end; confirm stock decreases.
+2. Check the dashboard loads real numbers (not zeros) — confirms DB + seed.3. Create a test order end-to-end; confirm stock decreases.
 4. Open DevTools → Network tab: every request should be HTTPS to your API
    origin, with `Authorization` and `x-business-id` headers.
 5. Test tenant isolation live: log in as `baraka@kiligadgets.co.tz` and
