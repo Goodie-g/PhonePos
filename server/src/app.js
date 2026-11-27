@@ -26,13 +26,21 @@ import { auditRoutes } from './modules/audit/audit.routes.js';
 export const createApp = () => {
   const app = express();
 
+  // Vercel preview deployments of the demo frontend (phone-pos-<hash>-<team>.vercel.app).
+  const isPreviewOrigin = (origin) => /^https:\/\/phone-pos(-[a-z0-9-]+)*\.vercel\.app$/i.test(origin);
+  const isAllowedOrigin = (origin) => config.corsOrigins.includes(origin) || isPreviewOrigin(origin);
+
   app.use(helmet());
   app.use(
     cors({
       origin(origin, cb) {
-        // Allow non-browser clients (curl, RN fetch has no Origin) and whitelisted origins.
-        if (!origin || config.corsOrigins.includes(origin)) return cb(null, true);
-        cb(new Error(`Origin not allowed by CORS: ${origin}`));
+        // Allow non-browser clients (curl, React Native) — they send no Origin.
+        if (!origin || isAllowedOrigin(origin)) return cb(null, true);
+        // Reject by omitting the CORS headers rather than throwing: a throw here
+        // becomes a 500 (and used to crash the process) for what is only a
+        // browser policy decision. The browser still blocks the response.
+        console.warn(`[cors] origin not allowed: ${origin}`);
+        return cb(null, false);
       },
       credentials: false, // bearer tokens, not cookies
     })

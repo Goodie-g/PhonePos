@@ -21,9 +21,14 @@ export const config = {
     // ephemeral port (port 0) and break hosts like Render that detect the port.
     return Number.isFinite(n) && n > 0 ? n : 4000;
   })(),
-  corsOrigins: (process.env.CORS_ORIGINS ?? 'http://localhost:8081')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
+  // Browser origins allowed to call the API. CORS_ORIGINS *adds* to the
+  // defaults instead of replacing them, so a misconfigured deployment can't
+  // lock the web client out of its own API.
+  corsOrigins: [
+    'http://localhost:8081', // Expo web dev server
+    'http://localhost:19006', // Expo web (legacy port)
+    'https://phone-pos.vercel.app', // deployed demo frontend
+    ...(process.env.CORS_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+  ].filter((origin, index, all) => all.indexOf(origin) === index),
   bcryptRounds: Number(process.env.BCRYPT_ROUNDS ?? 10),
 };

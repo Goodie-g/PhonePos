@@ -13,6 +13,7 @@
  *   store@uhuruphones.co.tz   — warehouse staff at Uhuru Phones
  */
 import 'dotenv/config';
+import { pathToFileURL } from 'node:url';
 import bcrypt from 'bcryptjs';
 import { PrismaClient } from '@prisma/client';
 import { createPurchaseOrder, receiveGoods, transitionPO } from '../src/modules/purchases/purchases.service.js';
@@ -37,7 +38,7 @@ const makeImei = (() => {
   };
 })();
 
-const main = async () => {
+const seedData = async () => {
   const existing = await prisma.business.count();
   if (existing > 0) {
     console.log('Database already contains businesses — skipping seed (reset it first if you want a fresh seed).');
@@ -356,6 +357,19 @@ const main = async () => {
   console.log(`  Login      : neema@uhuruphones.co.tz / ${PASSWORD}`);
 };
 
-main()
-  .catch((err) => { console.error(err); process.exitCode = 1; })
-  .finally(() => prisma.$disconnect());
+/**
+ * Idempotent demo seed. Skips entirely when the database already has data.
+ * Exported so the API can seed a fresh deployment on boot (see src/index.js).
+ */
+export const seed = seedData;
+
+/** Release the seed's own Prisma client (used after an in-process boot seed). */
+export const disconnectSeed = () => prisma.$disconnect();
+
+// Only run automatically when invoked directly: `node prisma/seed.js`.
+const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isDirectRun) {
+  seed()
+    .catch((err) => { console.error(err); process.exitCode = 1; })
+    .finally(() => prisma.$disconnect());
+}
